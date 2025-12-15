@@ -56,7 +56,7 @@ def load_vacancies(
 
     # Структура и описание датафрейма
     structure = df.dtypes
-    description = df.describe(include="all", datetime_is_numeric=True)
+    description = df.describe(include="all")
 
     return df, structure, description
 
