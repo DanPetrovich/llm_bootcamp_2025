@@ -14,5 +14,6 @@ if env_path.exists():
 
 API_KEY: str | None = os.getenv("API_KEY")
 DEBUG: bool = os.getenv("DEBUG", "false").lower() == "true"
+TELEGRAM_BOT_TOKEN: str | None = os.getenv("TELEGRAM_BOT_TOKEN")
 
 
