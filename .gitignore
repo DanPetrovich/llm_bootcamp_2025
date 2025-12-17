@@ -11,3 +11,6 @@ vacancies.json
 
 # Generated plots
 *.png
+
+# Generated code files
+generated_code/

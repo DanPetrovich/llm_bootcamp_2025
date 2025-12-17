@@ -1,8 +1,17 @@
 import os
 import re
+import time
+from threading import Lock
 from typing import Any, Dict
 
 import requests
+
+
+# Глобальная переменная для отслеживания времени последнего запроса
+_last_request_time = 0
+_request_lock = Lock()
+API_REQUEST_DELAY = 1.0  # Минимальная задержка между запросами в секундах
+MAX_RETRY_WAIT_TIME = 30  # Максимальное время ожидания при 429 ошибке (секунды)
 
 
 def get_system_prompt() -> str:
@@ -62,16 +71,38 @@ def get_user_prompt(
     Build the user prompt that describes:
     - the user's analytic request,
     - the high-level structure of the DataFrame,
-    - precomputed description/statistics.
+    - detailed field descriptions from description.json.
     - optionally: previous error and code for retry attempts.
     """
+    # Формируем описание полей из description.json
+    fields_description = ""
+    if isinstance(df_description, dict) and "fields" in df_description:
+        fields_description = "\nDetailed field descriptions:\n"
+        for field in df_description["fields"]:
+            name = field.get("name", "")
+            field_type = field.get("type", "")
+            desc = field.get("description", "")
+            example = field.get("example", "")
+            hint = field.get("aggregation_hint", "")
+            
+            fields_description += f"- {name} ({field_type}): {desc}"
+            if example:
+                fields_description += f" Example: {example}"
+            if hint:
+                fields_description += f" Hint: {hint}"
+            fields_description += "\n"
+        
+        if "notes" in df_description:
+            fields_description += "\nDataset notes:\n"
+            for note in df_description["notes"]:
+                fields_description += f"- {note}\n"
+    
     base_prompt = (
         "User task (in natural language):\n"
         f"{user_task}\n\n"
-        "Current DataFrame structure (column -> dtype as string):\n"
+        "DataFrame structure (column -> dtype):\n"
         f"{structure}\n\n"
-        "Precomputed description/statistics of the dataset (per-column stats):\n"
-        f"{df_description}\n\n"
+        f"{fields_description}\n"
     )
     
     if previous_error and previous_code:
@@ -117,6 +148,125 @@ def _extract_code_block(text: str) -> str:
     return code
 
 
+def get_relevance_check_system_prompt() -> str:
+    """
+    System prompt for checking if user's question is relevant to the vacancies dataset.
+    """
+    return (
+        "You are a data analyst assistant. Your task is to determine if a user's question "
+        "can be answered using the vacancies.json dataset.\n\n"
+        "The dataset contains information about job vacancies with fields like: "
+        "vacancy_id, published_at, position, specialization, seniority, salary_from, "
+        "salary_to, stack (technologies), company_name, location, etc.\n\n"
+        "Respond with ONLY one word:\n"
+        "- 'YES' if the question can be answered using this dataset\n"
+        "- 'NO' if the question is not related to job vacancies data or cannot be answered with this dataset\n\n"
+        "Do not provide any explanation, only 'YES' or 'NO'."
+    )
+
+
+def _wait_before_request() -> None:
+    """Добавляет задержку перед запросом к API для предотвращения rate limiting."""
+    global _last_request_time
+    
+    with _request_lock:
+        current_time = time.time()
+        time_since_last = current_time - _last_request_time
+        
+        if time_since_last < API_REQUEST_DELAY:
+            sleep_time = API_REQUEST_DELAY - time_since_last
+            time.sleep(sleep_time)
+        
+        _last_request_time = time.time()
+
+
+def _make_api_request_with_retry(url: str, headers: Dict[str, str], payload: Dict[str, Any], max_retries: int = 3) -> requests.Response:
+    """
+    Выполняет запрос к API с обработкой 429 ошибок и повторными попытками.
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    for attempt in range(max_retries):
+        _wait_before_request()
+        
+        r = requests.post(url, headers=headers, json=payload, timeout=60)
+        
+        if r.status_code == 429:
+            # Rate limit exceeded - используем Retry-After или экспоненциальную задержку
+            retry_after = r.headers.get("Retry-After")
+            if retry_after:
+                try:
+                    wait_time = int(retry_after)
+                    # Если Retry-After слишком большой - сразу выбрасываем ошибку
+                    if wait_time > MAX_RETRY_WAIT_TIME:
+                        error_msg = (
+                            f"Rate limit exceeded (429). API requires waiting {wait_time}s ({wait_time // 60} minutes), "
+                            f"which exceeds maximum wait time of {MAX_RETRY_WAIT_TIME}s. "
+                            f"Please wait and try again later, or check your Groq API quota."
+                        )
+                        logger.error(error_msg)
+                        raise requests.exceptions.HTTPError(error_msg, response=r)
+                    
+                    logger.warning(f"Rate limit exceeded (429). Waiting {wait_time}s (from Retry-After header) before retry {attempt + 1}/{max_retries}...")
+                except (ValueError, TypeError):
+                    wait_time = MAX_RETRY_WAIT_TIME  # Фиксированная задержка
+                    logger.warning(f"Rate limit exceeded (429). Waiting {wait_time}s before retry {attempt + 1}/{max_retries}...")
+            else:
+                # Если Retry-After нет, используем фиксированную задержку
+                wait_time = MAX_RETRY_WAIT_TIME  # Фиксированная задержка (30 секунд)
+                logger.warning(f"Rate limit exceeded (429). Waiting {wait_time}s before retry {attempt + 1}/{max_retries}...")
+            
+            if attempt < max_retries - 1:
+                time.sleep(wait_time)
+                continue
+            else:
+                # После всех попыток все еще 429 - выбрасываем понятную ошибку
+                error_msg = (
+                    f"Rate limit exceeded after {max_retries} attempts. "
+                    f"Groq API rate limit has been reached. "
+                    f"Please wait a few minutes before trying again, or check your API quota."
+                )
+                logger.error(error_msg)
+                raise requests.exceptions.HTTPError(error_msg, response=r)
+        else:
+            r.raise_for_status()
+            return r
+    
+    # Не должно сюда дойти, но на всякий случай
+    r.raise_for_status()
+    return r
+
+
+def check_query_relevance(user_task: str) -> bool:
+    """
+    Проверяет, связан ли запрос пользователя с данными вакансий.
+    Возвращает True, если запрос релевантен, False - если нет.
+    """
+    system_prompt = get_relevance_check_system_prompt()
+    user_prompt = f"User question: {user_task}\n\nCan this question be answered using the vacancies dataset? Answer YES or NO only."
+    
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {os.environ['API_KEY']}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": "llama-3.3-70b-versatile",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.1,  # Низкая температура для более детерминированного ответа
+    }
+
+    r = _make_api_request_with_retry(url, headers, payload)
+    data = r.json()
+    
+    response = data["choices"][0]["message"]["content"].strip().upper()
+    return response.startswith("YES")
+
+
 def get_report_system_prompt() -> str:
     """
     System prompt for generating a human-readable analytical report.
@@ -129,15 +279,38 @@ def get_report_system_prompt() -> str:
         "- Write in Russian (if the user's question was in Russian) or English (if in English).\n"
         "- Be extremely concise: write ONLY 1 paragraph maximum (3-5 sentences).\n"
         "- Highlight the most important findings and insights from the metrics.\n"
-        "- Reference the generated plots by their names when discussing visualizations.\n"
+        "- Reference the generated plots by their ORDER NUMBER (1st, 2nd, 3rd, etc.) when discussing visualizations.\n"
+        "- NEVER mention file names or paths of plots. Use only order numbers like 'первый график', 'second chart', etc.\n"
         "- Use specific numbers from the metrics to support your conclusions.\n"
         "- Write in a professional but accessible tone.\n"
         "- Do not include technical jargon unless necessary.\n"
         "- Combine context, key findings, and conclusions in a single paragraph.\n\n"
-        "Important: Always mention plot names when referring to visualizations. "
-        "For example: 'Как видно на графике \"salary_distribution.png\"...' or "
-        "'The chart \"median_salaries.png\" shows that...'"
+        "Important: When referring to plots, use their order number (1st, 2nd, 3rd) instead of file names. "
+        "For example: 'Как видно на первом графике...' or 'The second chart shows that...'"
     )
+
+
+def _convert_to_json_serializable(obj: Any) -> Any:
+    """
+    Преобразует numpy/pandas типы в нативные Python типы для JSON сериализации.
+    """
+    import numpy as np
+    import pandas as pd
+    
+    if isinstance(obj, (np.integer, np.int64, np.int32, np.int16, np.int8)):
+        return int(obj)
+    elif isinstance(obj, (np.floating, np.float64, np.float32, np.float16)):
+        return float(obj)
+    elif isinstance(obj, (pd.Timestamp, pd.DatetimeTZDtype)):
+        return str(obj)
+    elif isinstance(obj, dict):
+        return {k: _convert_to_json_serializable(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [_convert_to_json_serializable(item) for item in obj]
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    else:
+        return obj
 
 
 def get_report_user_prompt(user_task: str, analytics_result: Dict[str, Any]) -> str:
@@ -148,18 +321,21 @@ def get_report_user_prompt(user_task: str, analytics_result: Dict[str, Any]) -> 
     """
     import json
     
-    # Форматируем метрики для читаемости
-    metrics_str = json.dumps(analytics_result.get("metrics", {}), ensure_ascii=False, indent=2)
+    # Преобразуем метрики в JSON-сериализуемый формат
+    metrics = analytics_result.get("metrics", {})
+    metrics_serializable = _convert_to_json_serializable(metrics)
     
-    # Форматируем информацию о графиках
+    # Форматируем метрики для читаемости
+    metrics_str = json.dumps(metrics_serializable, ensure_ascii=False, indent=2)
+    
+    # Форматируем информацию о графиках с номерами по порядку
     plots_info = analytics_result.get("plots", [])
     plots_str = ""
     if plots_info:
-        plots_str = "\nGenerated plots:\n"
-        for plot in plots_info:
+        plots_str = "\nGenerated plots (refer to them by order number: 1st, 2nd, 3rd, etc.):\n"
+        for idx, plot in enumerate(plots_info, 1):
             plot_name = plot.get("name", "unnamed")
-            plot_path = plot.get("path", "unknown")
-            plots_str += f"- {plot_name} (saved at: {plot_path})\n"
+            plots_str += f"{idx}. {plot_name}\n"
     else:
         plots_str = "\nNo plots were generated for this analysis.\n"
     
@@ -169,7 +345,9 @@ def get_report_user_prompt(user_task: str, analytics_result: Dict[str, Any]) -> 
         f"Metrics:\n{metrics_str}\n"
         f"{plots_str}\n"
         "Please write a very brief analytical report (1 paragraph, 3-5 sentences) that answers the user's question, "
-        "highlights the most important findings from the metrics, and references the plots when discussing visualizations. "
+        "highlights the most important findings from the metrics, and references the plots by their ORDER NUMBER "
+        "(1st, 2nd, 3rd, etc.) when discussing visualizations. "
+        "DO NOT mention file names or paths. Use only order numbers like 'первый график', 'second chart', etc. "
         "Write as if you are a data analyst presenting findings to a stakeholder. Be concise and to the point."
     )
 
@@ -192,8 +370,7 @@ def llm_request(user_prompt: str, system_prompt: str) -> str:
         "temperature": 0.2,
     }
 
-    r = requests.post(url, headers=headers, json=payload, timeout=60)
-    r.raise_for_status()
+    r = _make_api_request_with_retry(url, headers, payload)
     data = r.json()
 
     raw_content = data["choices"][0]["message"]["content"]
@@ -219,8 +396,7 @@ def llm_request_report(user_prompt: str, system_prompt: str) -> str:
         "temperature": 0.7,  # Немного выше для более естественного текста
     }
 
-    r = requests.post(url, headers=headers, json=payload, timeout=60)
-    r.raise_for_status()
+    r = _make_api_request_with_retry(url, headers, payload)
     data = r.json()
 
     return data["choices"][0]["message"]["content"].strip()
